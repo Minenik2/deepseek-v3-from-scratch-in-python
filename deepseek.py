@@ -44,4 +44,10 @@ class MLA(nn.Module):
             self.softmax_scale = self.softmax_scale * mscale * mscale
         
         # KV CACHE
-            
+        if attn_impl == "naive": # not using deepseeks implementation but where using the 2017 attention implementation
+            self.register_buffer("k_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.qk_head_dim), persistent=False)
+            self.register_buffer("v_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.v_head_dim), persistent=False)
+        else:
+            # the implementation is deepseeks
+            self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.kv_lora_rank), persistent=False)
+            self.register_buffer("pe_cache", torch.zeros(args.max_batch_size, args.max_seq_len, self.n_local_heads, self.kv_lora_rank), persistent=False)
