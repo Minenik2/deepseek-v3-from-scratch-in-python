@@ -1,3 +1,70 @@
+@dataclass
+class ModelArgs:
+    """ 
+    Data class for defining model arguments and hyperparameters.
+    
+    Attributes:
+        max_batch_size (int): Maximum batch size.
+        max_seq_len (int): Maximum sequence length.
+        dtype (Literal["bf16", "fp8"]): Data type for computations.
+        vocab_size (int): Vocabulary size.
+        dim (int): Model dimension.
+        inter_dim (int): Intermediate dimension for MLP layers.
+        n_layers (int): Number of transformer layers.
+        n_dense_layers (int): Number of dense layers in the model.
+        n_heads (int): Number of attention heads.
+        n_routed_experts (int): Number of routed experts for MoE layers.
+        n_shared_experts (int): Number of shared experts for MoE layers.
+        n_activated_experts (int): Number of activated experts in MoE layers.
+        n_expert_groups (int): Number of expert groups.
+        n_limited_groups (int): Number of limited groups for MoE routing.
+        score_func (Literal["softmax", "sigmoid"]): Scoring function for MoE routing.
+        route_scale (float): Scaling factor for routing scores.
+        q_lora_rank (int): LoRA rank for query projections.
+        kv_lora_rank (int): LoRA rank for key-value projections.
+        qk_nope_head_dim (int): Dimension for query-key projections without positional embeddings.
+        qk_rope_head_dim (int): Dimension for query-key projections with rotary embeddings.
+        v_head_dim (int): Dimension for value projections.
+        original_seq_len (int): Original sequence length.
+        rope_theta (float): Base for rotary positional encoding.
+        rope_factor (float): Scaling factor for extended sequence lengths.
+        beta_fast (int): Fast beta correction factor.
+        beta_slow (int): Slow beta correction factor.
+        mscale (float): Scaling factor for extended attention.
+    """
+    max_batch_size: int = 8
+    max_seq_len: int = 4096 * 4
+    dtype: Literal["bf16", "fp8"] = "bf16"
+    vocab_size: int = 102400
+    dim: int = 2048
+    inter_dim: int = 10944
+    moe_inter_dim: int = 1408
+    n_layers: int = 27
+    n_dense_layers: int = 1
+    n_heads: int = 16
+    # moe
+    n_routed_experts: int = 64
+    n_shared_experts: int = 2
+    n_activated_experts: int = 6
+    n_expert_groups: int = 1
+    n_limited_groups: int = 1
+    score_func: Literal["softmax", "sigmoid"] = "softmax"
+    route_scale: float = 1.
+    # mla
+    q_lora_rank: int = 0
+    kv_lora_rank: int = 512
+    qk_nope_head_dim: int = 128
+    qk_rope_head_dim: int = 64
+    v_head_dim: int = 128
+    # yarn (another rope extention)
+    original_seq_len: int = 4096
+    rope_theta: float = 10000.0
+    rope_factor: float = 40
+    beta_fast: int = 32
+    beta_slow: int = 1
+    mscale: float = 1.
+
+
 class MLA(nn.Module):
     """ 
     Multi-Headed Attention Layer (MLA).
@@ -296,3 +363,120 @@ class MoE(nn.Module):
                 continue
             expert = self.experts[i]
             idx, top = torch.where(indices == i)
+            y[idx] += expert(x[idx]) * weights[idx,top, None]
+        z = self.shared_experts(x)
+        if world_size > 1: # if there's more than one gpu combine all the experts
+            dist.all_reduce(y)
+        return (y + z).view(shape)
+    
+class Block(nn.Module):
+    """ 
+    Transformer block combining attention and feed-forward layers.
+    
+    Attributes:
+        attn (nn.Module): Attention layer (MLA).
+        ffn (nn.Module): Feed-forward network (MLP or MoE).
+        attn_norm (nn.Module): Layer normalization for attention.
+        ffn_norm (nn.Module): Layer normalization for feed-forward network.
+    """
+    def __init__(self, layer_id: int, args: ModelArgs):
+        """
+        Initializes the Transformer block.
+
+        Args:
+            layer_id (int): Layer index in the transformer.
+            args (ModelArgs): Model arguments containing block parameters.
+        """
+        super().__init__()
+        self.attn = MLA(args)
+        self.ffn = MLP(args.dim, args.inter_dim) if layer_id < args.n_dense_layers else MoE(args)
+        self.attn_norm = RMSNorm(args.dim)
+        self.ffn_norm = RMSNorm(args.dim)
+    
+     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass for the Transformer block.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            start_pos (int): Starting position in the sequence.
+            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+            mask (Optional[torch.Tensor]): Mask tensor to exclude certain positions from attention.
+
+        Returns:
+            torch.Tensor: Output tensor after block computation.
+        """
+        x = x + self.attn(self.attn_norm(x), start_pos, freqs_cis, mask)
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+class Transformer(nn.Module):
+    """
+    Transformer model with positional embeddings, multiple layers, and output projection.
+
+    Attributes:
+        max_seq_len (int): Maximum sequence length for the transformer.
+        embed (nn.Module): Embedding layer for input tokens.
+        layers (torch.nn.ModuleList): List of transformer blocks.
+        norm (nn.Module): Layer normalization applied after all blocks.
+        head (nn.Module): Output projection layer mapping to vocabulary size.
+        freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+    """
+    def __init__(self, args: ModelArgs):
+        """
+        Initializes the Transformer model.
+
+        Args:
+            args (ModelArgs): Model arguments containing transformer parameters.
+        """
+        global world_size, rank
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        Linear.dtype = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
+        super().__init__()
+        self.max_seq_len = args.max_seq_len
+        self.embed = ParallelEmbedding(args.vocab_size, args.dim)
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(args.n_layers):
+            self.layers.append(Block(layer_id, args))
+        self.norm = RMSNorm(args.dim)
+        self.head = ColumnParallelLinear(args.dim, args.vocab_size, dtype=torch.get_default_dtype())
+        self.register_buffer("freqs_cis", precompute_freqs_cis(args), persistent=False)
+
+    # the code released by deepseek
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int = 0):
+        """
+        Forward pass for the Transformer model.
+
+        Args:
+            tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
+            start_pos (int, optional): Starting position in the sequence for rotary embeddings. Defaults to 0.
+
+        Returns:
+            torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
+        """
+        seqlen = tokens.size(1)
+        h = self.embed(tokens)
+        freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device).triu_(1)
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)[:, -1]
+        logits = self.head(h)
+        if world_size > 1:
+            all_logits = [torch.empty_like(logits) for _ in range(world_size)]
+            dist.all_gather(all_logits, logits)
+            logits = torch.cat(all_logits, dim=-1)
+        return logits
+
+if __name__ == "__main__":
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device("cuda")
+    torch.manual_seed(0)
+    args = ModelArgs()
+    x = torch.randint(0, args.vocab_size, (2, 128))
+    model = Transformer(args)
+    print(model(x).size())
